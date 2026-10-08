@@ -1,0 +1,13 @@
+# screenocr core runtime requirements (Python 3.11 / Windows 11)
+#
+# rapidocr-onnxruntime 1.4.4 bundles the PP-OCRv4 detection/recognition and
+# angle-classification ONNX models, so no model download happens at runtime.
+# onnxruntime, opencv-python, numpy, pyclipper, shapely, PyYAML, six and tqdm
+# arrive transitively from it; only this project's direct imports are pinned
+# here.
+#
+# mss>=9 and mss<11 are both supported: capture.py prefers the mss.MSS factory
+# introduced in 10.x and falls back to the deprecated mss.mss() on 9.x.
+Pillow>=10,<13
+mss>=9,<11
+rapidocr-onnxruntime==1.4.4
