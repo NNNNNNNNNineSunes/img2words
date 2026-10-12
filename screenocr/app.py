@@ -5,12 +5,15 @@ import argparse
 import ctypes
 from ctypes import wintypes
 import datetime
+import io
 import logging
 import os
 from pathlib import Path
 import queue
 import sys
 import threading
+import time
+from dataclasses import dataclass
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
@@ -26,6 +29,79 @@ from .ocr import OCREngine
 from .pipeline import NoTextError, recognize_and_copy
 from .permissions import MEDIUM_INTEGRITY, get_integrity_level, integrity_name
 from .tray import TrayIcon
+from .formula_backend import FormulaService
+from .formula_escape import EscapeUnavailable, FormulaEscapeObserver
+from .latex_format import format_latex
+from .recognition_mode import RecognitionMode
+
+FORMULA_DEADLINE_SECONDS = 30.0
+FORMULA_PNG_LIMIT = 8 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _FormulaRequest:
+    request_id: str
+    generation: int
+    mode: RecognitionMode
+    deadline: float
+
+
+class _BoundedPNG(io.BytesIO):
+    """A request-local in-memory PNG writer with a hard byte ceiling."""
+
+    def __init__(self, limit, cancel_event, deadline):
+        super().__init__()
+        self.limit = limit
+        self.cancel_event = cancel_event
+        self.deadline = deadline
+
+    def write(self, data):
+        if self.cancel_event.is_set() or time.monotonic() >= self.deadline:
+            raise TimeoutError("formula request expired during image preparation")
+        if self.tell() + len(data) > self.limit:
+            raise ValueError("formula image exceeds the 8 MiB limit")
+        return super().write(data)
+
+
+def _formula_worker(service, request, cancel_event, reply_queue, width, height, rgb):
+    """Free worker: only plain request state, service, queue and RGB bytes."""
+    reply = {"request_id": request.request_id, "generation": request.generation,
+             "status": "error", "raw": None, "error_tag": "internal", "message": "公式识别失败。",
+             "poisoned": False}
+    try:
+        if cancel_event.is_set():
+            raise InterruptedError("cancelled")
+        if (not isinstance(width, int) or isinstance(width, bool) or width <= 0 or
+                not isinstance(height, int) or isinstance(height, bool) or height <= 0 or
+                not isinstance(rgb, bytes) or len(rgb) != width * height * 3):
+            raise ValueError("invalid RGB selection")
+        if time.monotonic() >= request.deadline:
+            raise TimeoutError("formula deadline expired")
+        from PIL import Image
+        image = Image.frombytes("RGB", (width, height), rgb)
+        stream = _BoundedPNG(FORMULA_PNG_LIMIT, cancel_event, request.deadline)
+        image.save(stream, format="PNG", optimize=False)
+        png = stream.getvalue()
+        if cancel_event.is_set() or time.monotonic() >= request.deadline:
+            raise TimeoutError("formula request expired before recognition")
+        raw = service.recognize_payload(
+            png, request_id=request.request_id, cancel_event=cancel_event,
+            absolute_deadline=request.deadline)
+        if cancel_event.is_set() or time.monotonic() >= request.deadline:
+            raise TimeoutError("formula request expired after recognition")
+        reply.update(status="ok", raw=raw, error_tag="", message="")
+    except BaseException as exc:
+        reply["error_tag"] = "cancelled" if isinstance(exc, (InterruptedError,)) else type(exc).__name__[:48]
+        reply["message"] = "公式识别已取消。" if reply["error_tag"] == "cancelled" else "公式识别失败；文字模式仍可使用。"
+    try:
+        reply["poisoned"] = bool(service.poisoned)
+    except BaseException:
+        reply["poisoned"] = True
+    try:
+        reply_queue.put_nowait(reply)
+    except queue.Full:
+        # A fresh one-slot queue is private to this worker; this indicates corruption.
+        pass
 
 LOG = logging.getLogger(__name__)
 
@@ -92,6 +168,14 @@ class ScreenOCRApp:
         self.smoke_timer = None
         self.main_layout_timer = None
         self._status_trace = None
+        self.formula_enabled = tk.BooleanVar(value=False)
+        self.formula_checkbox = None
+        self.formula_warning_label = None
+        self.formula_service = None
+        self.formula_context = None
+        self.formula_generation = 0
+        self.formula_request_id = 0
+        self.formula_terminal = False
         self.history_sash_pending = False
         self.title_label = None
         self.info_label = None
@@ -137,6 +221,14 @@ class ScreenOCRApp:
                 row=row, column=column, sticky="we", padx=(0, 8), pady=(0, 6))
         for column in (0, 1):
             buttons.columnconfigure(column, weight=1, uniform="main_buttons")
+        self.formula_checkbox = ttk.Checkbutton(
+            buttons, text="启用公式 OCR（实验版）", variable=self.formula_enabled,
+            command=self._on_formula_toggle)
+        self.formula_checkbox.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 2))
+        self.formula_warning_label = ttk.Label(
+            buttons, text="公式识别可能出错，请核对结果；左 Alt 框选行内公式，左 Alt+Shift 框选独立公式。",
+            justify="left", wraplength=self._wrap)
+        self.formula_warning_label.grid(row=3, column=0, columnspan=2, sticky="we", pady=(0, 2))
         frame.bind("<Configure>", self._on_main_configure)
         self._fit_main_window()
         self._start_tray()
@@ -159,7 +251,7 @@ class ScreenOCRApp:
     def _set_wrap(self, wrap):
         """Apply one wrap width to both wrapping labels."""
         self._wrap = int(wrap)
-        for label in (self.info_label, self.status_label):
+        for label in (self.info_label, self.status_label, getattr(self, "formula_warning_label", None)):
             if label is not None:
                 label.configure(wraplength=self._wrap)
 
@@ -266,6 +358,202 @@ class ScreenOCRApp:
             LOG.exception("OCR initialization failed")
             self.events.put(("load_error", str(exc)))
 
+    def _set_formula_hook(self, enabled):
+        hook = getattr(self, "hook", None)
+        setter = getattr(hook, "set_formula_enabled", None)
+        if callable(setter):
+            setter(bool(enabled and not getattr(self, "formula_terminal", False)))
+
+    def _on_formula_toggle(self):
+        enabled = bool(getattr(self, "formula_enabled", None) and self.formula_enabled.get())
+        if getattr(self, "formula_terminal", False):
+            if getattr(self, "formula_enabled", None) is not None:
+                self.formula_enabled.set(False)
+            return
+        self._set_formula_hook(enabled)
+        if not enabled:
+            self._cancel_formula("公式识别已取消。")
+
+    def _formula_status(self, text):
+        if not getattr(self, "closing", False) and not getattr(self, "closed", False):
+            try:
+                self.status.set(text)
+            except Exception:
+                pass
+
+    def _formula_fault(self, context, message):
+        self.formula_terminal = True
+        try:
+            self.formula_enabled.set(False)
+        except Exception:
+            pass
+        self._set_formula_hook(False)
+        try:
+            self.hook.cancel_drag()
+            if getattr(self, "overlay", None):
+                self._remove_overlay()
+        except Exception:
+            pass
+        context["faulted"] = True
+        context["cancelled"] = True
+        if context.get("generation", -1) >= 0:
+            self.formula_generation = getattr(self, "formula_generation", 0) + 1
+            context["generation"] = -1
+        context["event"].set()
+        try:
+            if getattr(self, "formula_service", None) is not None:
+                self.formula_service.cancel_active()
+        except Exception:
+            pass
+        context["observer_stopping"] = True
+        try:
+            context["observer"].stop()
+        except Exception:
+            pass
+        if not context.get("worker_started"):
+            context["worker_done"] = True
+        self._formula_status(message)
+
+    def _cancel_formula(self, message="公式识别已取消。"):
+        context = getattr(self, "formula_context", None)
+        if context is None:
+            return
+        context["cancelled"] = True
+        context["event"].set()
+        self.formula_generation = getattr(self, "formula_generation", 0) + 1
+        context["generation"] = -1
+        try:
+            if getattr(self, "formula_service", None) is not None:
+                self.formula_service.cancel_active()
+        except Exception:
+            pass
+        if getattr(self, "overlay", None):
+            try:
+                self.hook.cancel_drag()
+            except Exception:
+                pass
+            self._remove_overlay()
+        context["observer_stopping"] = True
+        try:
+            context["observer"].stop()
+        except Exception:
+            self._formula_fault(context, "公式取消监视器异常；公式模式已关闭。")
+        self._formula_status(message)
+        self._try_finish_formula_context(context)
+
+    def _try_finish_formula_context(self, context):
+        if getattr(self, "formula_context", None) is not context:
+            return
+        if not context.get("worker_done"):
+            return
+        if context.get("backend_poisoned"):
+            self.formula_context = None
+            if not getattr(self, "closing", False) and not getattr(self, "closed", False):
+                self.hook.enabled.set()
+            return
+        observer = context["observer"]
+        faulted = context.get("faulted", False) or bool(getattr(observer, "faulted", True))
+        done = bool(getattr(observer, "done", False))
+        clean = bool(getattr(observer, "clean", False))
+        if faulted:
+            self.formula_terminal = True
+            self._set_formula_hook(False)
+            try:
+                self.formula_enabled.set(False)
+            except Exception:
+                pass
+        if not faulted and not (done and clean):
+            return
+        self.formula_context = None
+        if getattr(self, "closing", False) or getattr(self, "closed", False):
+            return
+        self.hook.enabled.set()  # formula mode is independently kept disabled when terminal
+
+    def _formula_commit_guard(self, context):
+        try:
+            if ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:
+                context["event"].set()
+            observer = context["observer"]
+            return bool(
+                getattr(self, "formula_context", None) is context and
+                getattr(self, "formula_generation", -1) == context["generation"] and
+                bool(getattr(self, "formula_enabled", None) and self.formula_enabled.get()) and
+                not getattr(self, "closing", False) and not getattr(self, "closed", False) and
+                not context["event"].is_set() and time.monotonic() < context["deadline"] and
+                not bool(getattr(observer, "faulted", True)) and
+                bool(getattr(observer, "healthy", False)) and
+                getattr(self, "formula_service", None) is not None and
+                not bool(getattr(getattr(self, "formula_service", None), "closed", True)) and
+                not bool(getattr(getattr(self, "formula_service", None), "poisoned", True))
+            )
+        except BaseException:
+            return False
+
+    def _consume_formula_reply(self, context, reply):
+        if getattr(self, "formula_context", None) is not context:
+            return
+        context["worker_done"] = True
+        if (reply.get("request_id") != context.get("request_id") or
+                reply.get("generation") != context.get("generation") or
+                getattr(self, "formula_generation", -1) != context.get("generation")):
+            context["cancelled"] = True
+        if reply.get("poisoned"):
+            context["backend_poisoned"] = True
+            self.formula_terminal = True
+            self._set_formula_hook(False)
+            try:
+                self.formula_enabled.set(False)
+            except Exception:
+                pass
+        if not context.get("cancelled") and not context.get("faulted") and reply.get("status") == "ok":
+            try:
+                formatted = format_latex(reply.get("raw"), context["mode"])
+                write_text(formatted, commit_guard=lambda: self._formula_commit_guard(context))
+            except Exception as exc:
+                self._formula_status("公式识别或复制失败；请继续使用 Ctrl 文字识别。")
+                if type(exc).__name__ == "ClipboardCommitRejected":
+                    context["cancelled"] = True
+            else:
+                # SetClipboardData success is irreversible; a later stop/cancel cannot veto it.
+                context["copied"] = True
+                if self._record_history(formatted) is False:
+                    self._formula_status("公式已复制，但历史记录保存失败。")
+                else:
+                    self._formula_status(f"公式已复制（{len(formatted)} 个字符）。")
+                    self._refresh_history_if_open()
+        else:
+            self._formula_status("公式识别已取消。" if context.get("cancelled") else
+                                 "公式识别失败；文字模式仍可使用。")
+        context["observer_stopping"] = True
+        try:
+            context["observer"].stop()
+        except Exception:
+            self._formula_fault(context, "公式取消监视器异常；公式模式已关闭。")
+        self._try_finish_formula_context(context)
+
+    def _poll_formula(self):
+        context = getattr(self, "formula_context", None)
+        if context is None:
+            return
+        observer = context["observer"]
+        if bool(getattr(observer, "faulted", False)):
+            self._formula_fault(context, "公式取消监视器异常；公式模式已关闭。")
+        elif not context.get("observer_stopping") and (
+                bool(getattr(observer, "done", False)) or not bool(getattr(observer, "healthy", False))):
+            self._formula_fault(context, "公式取消监视器意外退出；公式模式已关闭。")
+        elif context["event"].is_set() and not context.get("cancelled"):
+            self._cancel_formula()
+            return
+        if context.get("worker_started") and not context.get("reply_consumed"):
+            try:
+                reply = context["reply_queue"].get_nowait()
+            except queue.Empty:
+                reply = None
+            if reply is not None:
+                context["reply_consumed"] = True
+                self._consume_formula_reply(context, reply)
+        self._try_finish_formula_context(context)
+
     def _poll(self):
         self.poll_timer = None      # this firing consumed the tracked id
         if self.closing:
@@ -274,9 +562,15 @@ class ScreenOCRApp:
             # Bound processing so a stream of mouse movement cannot starve Tk.
             for _ in range(200):
                 try:
-                    event, value = self.events.get_nowait()
+                    item = self.events.get_nowait()
                 except queue.Empty:
                     break
+                if not isinstance(item, tuple) or len(item) not in (2, 3):
+                    continue
+                event, value = item[:2]
+                event_mode = item[2] if len(item) == 3 else RecognitionMode.TEXT
+                if event_mode not in (RecognitionMode.TEXT, RecognitionMode.INLINE, RecognitionMode.DISPLAY):
+                    continue
                 if event == "loaded":
                     self.engine = value
                     self.hook.start()
@@ -297,14 +591,21 @@ class ScreenOCRApp:
                     self.status.set("模型加载失败，请检查依赖后重新启动。")
                     self._notify(f"OCR 模型加载失败：{value}", error=True)
                 elif event == "start":
-                    LOG.info("SELECTION_START: Ctrl+left-button activation received")
-                    self._begin(value)
+                    if event_mode is RecognitionMode.TEXT or bool(getattr(self, "formula_enabled", None) and self.formula_enabled.get()):
+                        self._begin(value, event_mode)
                 elif event == "move" and self.overlay:
-                    self._draw(value)
+                    context = getattr(self, "formula_context", None)
+                    if context is None or event_mode is context.get("mode"):
+                        self._draw(value)
                 elif event == "end" and self.overlay:
-                    self._finish(value)
+                    context = getattr(self, "formula_context", None)
+                    if context is None and event_mode is RecognitionMode.TEXT:
+                        self._finish(value)
+                    elif context is not None and event_mode is context.get("mode"):
+                        self._finish(value, event_mode)
                 elif event == "result":
-                    self.hook.enabled.set()
+                    if getattr(self, "formula_context", None) is None:
+                        self.hook.enabled.set()
                     self.status.set(f"已复制 {len(value)} 个字符，可 Ctrl+V 粘贴。")
                     self._notify(f"识别完成，已复制 {len(value)} 个字符。")
                     LOG.info("OCR completed: %s characters copied", len(value))
@@ -316,12 +617,15 @@ class ScreenOCRApp:
                     self._notify(str(value), error=True)
                     LOG.warning("HISTORY_SAVE_FAILED: the copied text is still on the clipboard")
                 elif event == "error":
-                    self.hook.enabled.set()
+                    if getattr(self, "formula_context", None) is None:
+                        self.hook.enabled.set()
                     self.status.set(str(value))
                     self._notify(str(value), error=True)
                 elif event == "hook_error":
                     self.ready = False
                     self.status.set(f"鼠标快捷键异常：{value}；请重新启动。")
+                    if getattr(self, "formula_context", None) is not None:
+                        self._cancel_formula("鼠标快捷键异常；公式任务已取消。")
                     self._remove_overlay()
                     self._notify(self.status.get(), error=True)
                 elif event == "tray_show":
@@ -331,6 +635,7 @@ class ScreenOCRApp:
                     LOG.info("TRAY_EXIT: exit requested from the notification area")
                     self.close()
                     return
+            self._poll_formula()
             if getattr(self, "tray_available", False) and not self._tray_is_available():
                 self._tray_lost()
             if self.overlay and ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:
@@ -339,7 +644,9 @@ class ScreenOCRApp:
             LOG.exception("GUI event failed")
             self._remove_overlay()
             self.hook.cancel_drag()
-            if self.ready:
+            if getattr(self, "formula_context", None) is not None:
+                self._cancel_formula("操作失败；公式任务已取消。")
+            elif self.ready:
                 self.hook.enabled.set()
             self.status.set(f"操作失败：{exc}")
             self._notify(self.status.get(), error=True)
@@ -472,19 +779,60 @@ class ScreenOCRApp:
         else:
             self.hide_main()
 
-    def _begin(self, point):
+    def _begin(self, point, mode=RecognitionMode.TEXT):
         self._dismiss_toast()
+        if mode not in (RecognitionMode.TEXT, RecognitionMode.INLINE, RecognitionMode.DISPLAY):
+            return
+        if mode is not RecognitionMode.TEXT:
+            if not getattr(self, "formula_enabled", None) or not self.formula_enabled.get() or getattr(self, "formula_terminal", False):
+                self.hook.cancel_drag()
+                self.hook.enabled.set()
+                return
+            self.formula_generation = getattr(self, "formula_generation", 0) + 1
+            cancel_event = threading.Event()
+            observer = FormulaEscapeObserver(cancel_event)
+            context = {"event": cancel_event, "observer": observer, "mode": mode,
+                       "generation": self.formula_generation, "worker_started": False,
+                       "worker_done": True, "reply_consumed": False, "cancelled": False,
+                       "faulted": False, "copied": False}
+            self.formula_context = context
+            try:
+                observer.start(ready_timeout=1.0)
+                if cancel_event.is_set() or bool(getattr(observer, "faulted", False)) or not bool(getattr(observer, "healthy", False)):
+                    raise EscapeUnavailable("observer_not_healthy")
+            except Exception:
+                self._formula_fault(context, "公式取消监视器不可用；公式模式已关闭。")
+                return
         self.start_point = point
         try:
-            # Freeze before showing our overlay, so the mask is never OCR'd.
+            # Recheck the latched observer immediately before the irreversible capture.
+            if mode is not RecognitionMode.TEXT:
+                context = self.formula_context
+                if (context["event"].is_set() or bool(getattr(context["observer"], "faulted", False)) or
+                        not bool(getattr(context["observer"], "healthy", False))):
+                    self._cancel_formula("公式框选已取消。")
+                    return
+            # Formula observer is armed before capture; capture still precedes overlay.
             self.snapshot, self.bounds = capture_screen()
         except Exception as exc:
             LOG.exception("Screen capture failed")
             self.hook.cancel_drag()
-            self.hook.enabled.set()
+            if mode is RecognitionMode.TEXT:
+                self.hook.enabled.set()
+            else:
+                self._cancel_formula("截图失败；公式任务已取消。")
             self.status.set(f"截图失败：{exc}")
             self._notify(self.status.get(), error=True)
             return
+        if mode is not RecognitionMode.TEXT:
+            context = getattr(self, "formula_context", None)
+            if (context is None or context["event"].is_set() or
+                    not bool(getattr(context["observer"], "healthy", False)) or
+                    bool(getattr(context["observer"], "faulted", False))):
+                if context is not None:
+                    self._cancel_formula("公式框选已取消。")
+                return
+        self.selection_mode = mode
         window = self.overlay = tk.Toplevel(self.root)
         window.withdraw()
         window.overrideredirect(True)
@@ -529,20 +877,94 @@ class ScreenOCRApp:
         self.canvas.coords(self.caption, max(12, min(x1-left, self.bounds.width-360)),
                            max(12, min(y1-top-32, self.bounds.height-35)))
 
-    def _finish(self, point):
+    def _finish(self, point, mode=RecognitionMode.TEXT):
+        context = getattr(self, "formula_context", None)
+        if mode is RecognitionMode.TEXT:
+            if context is not None:
+                return
+        else:
+            if context is None or mode is not context.get("mode"):
+                return
+            if (context.get("up_accepted") or context.get("worker_started") or
+                    context.get("cancelled") or context["event"].is_set()):
+                return
+            if getattr(self, "formula_generation", -1) != context.get("generation"):
+                self._cancel_formula()
+                return
+            observer = context["observer"]
+            if bool(getattr(observer, "faulted", False)) or not bool(getattr(observer, "healthy", False)):
+                self._formula_fault(context, "公式取消监视器意外退出；公式模式已关闭。")
+                return
+            # UP is the deadline origin: normalize_rect and every later stage count.
+            context["up_accepted"] = True
+            context["deadline"] = time.monotonic() + FORMULA_DEADLINE_SECONDS
         rect = normalize_rect(self.start_point, point, self.bounds)
+        if mode is not RecognitionMode.TEXT and time.monotonic() >= context["deadline"]:
+            self._cancel_formula("公式识别超时；文字模式仍可使用。")
+            return
         if rect is None:
             self._remove_overlay()
-            self.hook.enabled.set()
-            self.status.set("选区太小：请至少框选 5 × 5 像素。")
+            if mode is RecognitionMode.TEXT:
+                self.hook.enabled.set()
+                self.status.set("选区太小：请至少框选 5 × 5 像素。")
+            else:
+                self._cancel_formula("选区太小；公式任务已取消。")
             self._notify(self.status.get(), error=True)
             return
-        image = self.snapshot.crop((rect.left-self.bounds.left, rect.top-self.bounds.top,
-                                    rect.right-self.bounds.left, rect.bottom-self.bounds.top))
-        self._remove_overlay()
-        self.status.set("正在识别……请稍候")
-        self.worker = threading.Thread(target=self._recognize, args=(image,), name="ocr-worker", daemon=True)
-        self.worker.start()
+        if mode is RecognitionMode.TEXT:
+            image = self.snapshot.crop((rect.left-self.bounds.left, rect.top-self.bounds.top,
+                                        rect.right-self.bounds.left, rect.bottom-self.bounds.top))
+            self._remove_overlay()
+            self.status.set("正在识别……请稍候")
+            self.worker = threading.Thread(target=self._recognize, args=(image,), name="ocr-worker", daemon=True)
+            self.worker.start()
+            return
+        try:
+            if (context["event"].is_set() or time.monotonic() >= context["deadline"] or
+                    not bool(getattr(context["observer"], "healthy", False)) or
+                    bool(getattr(context["observer"], "faulted", False))):
+                raise InterruptedError("formula selection cancelled or expired")
+            image = self.snapshot.crop((rect.left-self.bounds.left, rect.top-self.bounds.top,
+                                        rect.right-self.bounds.left, rect.bottom-self.bounds.top))
+            width, height = image.size
+            rgb = image.tobytes()
+            if context["event"].is_set() or time.monotonic() >= context["deadline"]:
+                raise TimeoutError("formula deadline expired during RGB acquisition")
+            if getattr(self, "formula_service", None) is None:
+                self.formula_service = FormulaService(str(Path(__file__).parents[1]))
+            if context["event"].is_set() or time.monotonic() >= context["deadline"]:
+                raise TimeoutError("formula deadline expired before worker start")
+            self.formula_request_id = getattr(self, "formula_request_id", 0) + 1
+            request_id = f"formula-{context['generation']}-{self.formula_request_id}"
+            if len(request_id) > 96 or not request_id.isascii():
+                raise ValueError("formula request identifier is invalid")
+            context["request_id"] = request_id
+            request = _FormulaRequest(request_id, context["generation"], mode, context["deadline"])
+            reply_queue = queue.Queue(maxsize=1)
+            context["reply_queue"] = reply_queue
+            context["worker_started"] = True
+            context["worker_done"] = False
+            self._remove_overlay()
+            self.status.set("正在识别公式……请稍候")
+            worker = threading.Thread(
+                target=_formula_worker,
+                args=(self.formula_service, request, context["event"], reply_queue, width, height, rgb),
+                name="formula-worker", daemon=True)
+            context["worker"] = worker
+            worker.start()
+        except Exception:
+            self._remove_overlay()
+            context["cancelled"] = True
+            context["event"].set()
+            context["worker_started"] = False
+            context["worker_done"] = True
+            context["observer_stopping"] = True
+            try:
+                context["observer"].stop()
+            except Exception:
+                pass
+            self._formula_status("公式任务未能启动；文字模式仍可使用。")
+            self._try_finish_formula_context(context)
 
     def _recognize(self, image):
         try:
@@ -575,6 +997,9 @@ class ScreenOCRApp:
             return False
 
     def _cancel(self):
+        if getattr(self, "formula_context", None) is not None:
+            self._cancel_formula()
+            return
         if self.overlay:
             self.hook.cancel_drag()
             self._remove_overlay()
@@ -1218,6 +1643,19 @@ class ScreenOCRApp:
             return
         self.closing = True
         self.closed = True
+        context = getattr(self, "formula_context", None)
+        if context is not None:
+            try:
+                context["event"].set()
+                context["observer"].stop()
+            except Exception:
+                pass
+        service = getattr(self, "formula_service", None)
+        if service is not None:
+            try:
+                service.close()
+            except Exception:
+                LOG.warning("CLEANUP_FAILED (formula service)")
         for name in ("poll_timer", "smoke_timer", "background_timer", "main_layout_timer"):
             timer = getattr(self, name, None)
             if timer is None:
@@ -1248,7 +1686,7 @@ class ScreenOCRApp:
                      "buttons_frame", "history_view", "history_splitter", "history_left",
                      "history_right", "history_list", "history_text", "history_status_var",
                      "history_status_label", "canvas", "outline", "caption", "backdrop",
-                     "overlay", "toast", "snapshot"):
+                     "overlay", "toast", "snapshot", "formula_enabled", "formula_checkbox", "formula_warning_label", "formula_context", "formula_service"):
             setattr(self, name, None)
         self.root = None
         if root is not None:

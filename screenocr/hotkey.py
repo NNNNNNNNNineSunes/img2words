@@ -1,4 +1,10 @@
-"""Windows Ctrl+left-drag listener. Hook callbacks never perform OCR or Tk work."""
+"""Windows modifier mouse listener, staged only (not installed in the live app).
+
+Formula events are (kind, point, RecognitionMode) triples. The current
+screenocr.app._poll unpacks two-tuples and would reject these triples; do not
+install this stage until the corresponding M3 GUI integration accepts both.
+Hook callbacks never perform OCR or Tk work.
+"""
 from __future__ import annotations
 
 import ctypes
@@ -7,29 +13,41 @@ import queue
 import sys
 import threading
 
+from screenocr.recognition_mode import RecognitionMode, choose_mode
+
 
 class MouseHook:
-    """Emit (start|move|end, (physical_x, physical_y)) to a thread-safe queue.
+    """Emit legacy TEXT pairs and formula-mode triples to a thread-safe queue.
 
-    The activating mouse-down/up are swallowed so underlying applications do
-    not receive an unmatched click or change their selection. Normal clicks
-    and movement pass through. A released Ctrl does not cancel an active drag.
+    A selected activation and its matching button-up are swallowed. Normal
+    clicks and movement pass through; the selected mode is frozen for a drag.
     """
 
     def __init__(self, events: queue.Queue):
         self.events = events
         self.enabled = threading.Event()
         self.enabled.set()
+        self._formula_enabled = threading.Event()  # Experimental formula modes default OFF.
         self._ready = threading.Event()
         self._thread = None
         self._thread_id = 0
         self._dragging = False
         self._cancelled = False
+        self._mode = None
         self._error = None
         self._callback = None  # Keep the ctypes callback alive for the hook.
         self._callback_count = 0
         self._left_down_count = 0
         self._activation_count = 0
+
+    def set_formula_enabled(self, value: bool) -> None:
+        """Enable formula modifiers for later DOWN events only; safe from any thread."""
+        if type(value) is not bool:
+            raise TypeError("value must be bool")
+        if value:
+            self._formula_enabled.set()
+        else:
+            self._formula_enabled.clear()
 
     def diagnostics(self):
         """Counts only: no key contents, screenshots or cursor coordinates recorded."""
@@ -37,27 +55,42 @@ class MouseHook:
                 "activations": self._activation_count,
                 "thread_alive": bool(self._thread and self._thread.is_alive())}
 
-    def _handle_mouse(self, message, point, ctrl_down=False):
-        """Process one mouse notification; return whether it must be swallowed."""
+    def _handle_mouse(self, message, point, ctrl_down=False, *, left_alt_down=False,
+                      right_alt_down=False, shift_down=False):
+        """Process one mouse notification from already-observed modifier states."""
         self._callback_count += 1
-        if message == 0x0201:  # WM_LBUTTONDOWN
+        if message == 0x0201:  # WM_LBUTTONDOWN: choose once and freeze until UP.
             self._left_down_count += 1
-            if not self._dragging and self.enabled.is_set() and ctrl_down:
-                self.enabled.clear()
-                self._dragging = True
-                self._cancelled = False
-                self._activation_count += 1
-                self.events.put(("start", point))
-                return True
+            if not self._dragging and self.enabled.is_set():
+                mode = choose_mode(ctrl=ctrl_down, left_alt=left_alt_down,
+                                   right_alt=right_alt_down, shift=shift_down)
+                if mode in (RecognitionMode.INLINE, RecognitionMode.DISPLAY) and not self._formula_enabled.is_set():
+                    mode = None
+                if mode is not None:
+                    self.enabled.clear()
+                    self._dragging = True
+                    self._cancelled = False
+                    self._mode = mode
+                    self._activation_count += 1
+                    self._put_drag_event("start", point)
+                    return True
         elif message == 0x0200 and self._dragging:  # WM_MOUSEMOVE
             if not self._cancelled:
-                self.events.put(("move", point))
+                self._put_drag_event("move", point)
         elif message == 0x0202 and self._dragging:  # WM_LBUTTONUP
             self._dragging = False
             if not self._cancelled:
-                self.events.put(("end", point))
+                self._put_drag_event("end", point)
+            self._cancelled = False
+            self._mode = None
             return True
         return False
+
+    def _put_drag_event(self, kind, point):
+        if self._mode is RecognitionMode.TEXT:
+            self.events.put((kind, point))
+        else:
+            self.events.put((kind, point, self._mode))
 
     def start(self):
         if sys.platform != "win32":
@@ -114,8 +147,17 @@ class MouseHook:
                 if code >= 0:
                     info = ctypes.cast(data, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                     point = (info.pt.x, info.pt.y)
-                    ctrl_down = message == 0x0201 and bool(user32.GetAsyncKeyState(0x11) & 0x8000)
-                    if self._handle_mouse(message, point, ctrl_down):
+                    ctrl_down = left_alt_down = right_alt_down = shift_down = False
+                    if message == 0x0201:  # Query modifiers on DOWN only.
+                        key_down = lambda vk: bool(user32.GetAsyncKeyState(vk) & 0x8000)
+                        ctrl_down = key_down(0x11)
+                        left_alt_down = key_down(0xA4)
+                        right_alt_down = key_down(0xA5)
+                        shift_down = key_down(0x10)
+                    if self._handle_mouse(message, point, ctrl_down,
+                                          left_alt_down=left_alt_down,
+                                          right_alt_down=right_alt_down,
+                                          shift_down=shift_down):
                         return 1
             except Exception as exc:
                 # Exceptions must never escape a native callback.

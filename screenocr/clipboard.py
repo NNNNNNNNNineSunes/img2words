@@ -16,7 +16,13 @@ import sys
 import time
 from typing import Any, Callable, Optional, Tuple
 
-__all__ = ["ClipboardError", "is_available", "read_text", "write_text"]
+__all__ = [
+    "ClipboardCommitRejected",
+    "ClipboardError",
+    "is_available",
+    "read_text",
+    "write_text",
+]
 
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
@@ -31,6 +37,10 @@ _WIN32 = sys.platform == "win32"
 
 class ClipboardError(RuntimeError):
     """Raised when the Windows clipboard cannot be read or written."""
+
+
+class ClipboardCommitRejected(ClipboardError):
+    """Raised when a trusted ``commit_guard`` vetoes the clipboard commit."""
 
 
 class _Busy(Exception):
@@ -171,6 +181,7 @@ def write_text(
     *,
     retries: int = DEFAULT_RETRIES,
     retry_delay: float = DEFAULT_RETRY_DELAY,
+    commit_guard: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Replace the clipboard contents with *text* (``CF_UNICODETEXT``).
 
@@ -180,9 +191,16 @@ def write_text(
     way to roll back: if ``SetClipboardData`` then fails, the clipboard stays
     empty and :class:`ClipboardError` is raised.  Ownership of the block moves
     to the system on success, and every failure path frees it.
+
+    A falsey *commit_guard* result raises :class:`ClipboardCommitRejected` before
+    the clipboard is emptied; the prepared block is still freed. Exceptions from
+    the guard propagate unchanged and are never classified as clipboard-busy.
     """
     if not isinstance(text, str):
         raise TypeError(f"text must be str, got {type(text).__name__}")
+
+    if commit_guard is not None and not callable(commit_guard):
+        raise TypeError(f"commit_guard must be callable, got {type(commit_guard).__name__}")
 
     user32, kernel32 = _load_api()
 
@@ -191,6 +209,7 @@ def write_text(
     handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
     if not handle:
         raise ClipboardError("GlobalAlloc failed while preparing the clipboard text")
+    guard_error = None
     try:
         pointer = kernel32.GlobalLock(handle)
         if not pointer:
@@ -201,6 +220,17 @@ def write_text(
             kernel32.GlobalUnlock(handle)
 
         def action() -> None:
+            nonlocal guard_error
+            if commit_guard is not None:
+                try:
+                    authorized = bool(commit_guard())
+                except BaseException as exc:
+                    guard_error = exc
+                    raise ClipboardCommitRejected(
+                        "clipboard commit guard raised an exception"
+                    ) from None
+                if not authorized:
+                    raise ClipboardCommitRejected("clipboard commit rejected by guard")
             if not user32.EmptyClipboard():
                 raise ClipboardError("EmptyClipboard failed")
             if not user32.SetClipboardData(CF_UNICODETEXT, handle):
@@ -212,5 +242,7 @@ def write_text(
         _session(user32, retries, retry_delay, action)
     except BaseException:
         kernel32.GlobalFree(handle)
+        if guard_error is not None:
+            raise guard_error
         raise
     # Ownership moved to the clipboard owner (the system); do not free it.

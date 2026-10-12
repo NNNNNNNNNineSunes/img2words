@@ -1,7 +1,11 @@
 .venv/
+.venv-formula/
+.venv-formula-paddle/
 __pycache__/
 *.py[cod]
 logs/
 artifacts/
 .permission-recovery/
 data/
+models/formula/
+/verification/
